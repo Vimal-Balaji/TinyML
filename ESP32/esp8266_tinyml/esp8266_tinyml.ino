@@ -1,360 +1,213 @@
-#include <Arduino.h>
-#include <pgmspace.h>
-#include <stdint.h>
-#include <math.h>
+/*
+  TinyStudentDSCNN inference on ESP8266
+  --------------------------------------
+  - All conv/fc weights are stored as int8_t (quantized) to save flash/RAM.
+  - Each layer is dequantized on-the-fly during the MAC:  real_w = int8_w * scale
+    (zero_point is 0 for every layer in this checkpoint, so it's omitted from
+    the dequant formula; if you requantize with a nonzero zero_point, subtract
+    it from the int8 value before multiplying by scale.)
+  - Biases are kept as float32 (they are tiny in count, so no benefit to
+    quantizing them, and doing so would only hurt accuracy).
+  - Architecture (mirrors manual_cpy.py's manual_forward exactly):
+        input (13 x 101 MFCC)
+          -> stem:      Conv1d(13->22, k=5, s=2, p=2) + ReLU        -> (22 x 51)
+          -> block1.dw: Conv1d(22->22, k=3, s=1, p=1, groups=22) + ReLU -> (22 x 51)
+          -> block1.pw: Conv1d(22->22, k=1)                          + ReLU -> (22 x 51)
+          -> block2.dw: Conv1d(22->22, k=3, s=2, p=1, groups=22) + ReLU -> (22 x 26)
+          -> block2.pw: Conv1d(22->44, k=1)                          + ReLU -> (44 x 26)
+          -> global average pool                                    -> (44)
+          -> fc: Linear(44->12)                                      -> (12) logits
+  - Prints the logits vector and the argmax class to the Serial Monitor.
+    Values should match the numpy reference in manual_cpy.py bit-for-bit
+    within float rounding error.
+
+  Flash usage for weights (int8): 1430 + 66 + 484 + 66 + 968 + 528 = 3542 bytes
+  Bias usage (float32):           (22+22+22+44+12)*4              =  488 bytes
+*/
+
 #include "model_weights.h"
+#include "sample_input.h"
 
-#define MFCC_CH 13
-#define INPUT_LEN 101      // CHANGE to the MFCC frame count used during training
-#define STEM_LEN ((INPUT_LEN + 1) / 2) // Conv1d k=5, stride=2, pad=2
-#define B1_LEN STEM_LEN
-#define B2_LEN ((B1_LEN + 1) / 2)     // k=3, stride=2, pad=1
-#define WIDTH 22
-#define OUT_CH 44
-#define NUM_CLASSES 12
+// ---------------------------------------------------------------------
+// Scratch buffers sized for the largest intermediate tensor at each stage
+// ---------------------------------------------------------------------
+static float stem_out[STEM_COUT][51];      // after stem:      22 x 51
+static float b1dw_out[B1DW_C][51];         // after block1.dw: 22 x 51
+static float b1pw_out[B1PW_COUT][51];      // after block1.pw: 22 x 51
+static float b2dw_out[B2DW_C][26];         // after block2.dw: 22 x 26
+static float b2pw_out[B2PW_COUT][26];      // after block2.pw: 44 x 26
+static float pooled[B2PW_COUT];            // global avg pool: 44
+static float logits[FC_COUT];              // final logits:    12
 
-// RAM buffers: activations only. Weights stay in flash.
-// input_q removed -- the stem conv now reads the float MFCC buffer directly.
-static uint8_t stem_out[WIDTH * STEM_LEN];
-static uint8_t b1_dw[WIDTH * B1_LEN];
-static uint8_t b1_out[WIDTH * B1_LEN];
-static uint8_t b2_dw[WIDTH * B2_LEN];
-static uint8_t b2_out[OUT_CH * B2_LEN];
-static uint8_t pooled[OUT_CH];
-static uint8_t logits_q[NUM_CLASSES];
+// Input MFCC copied out of PROGMEM into RAM for easy indexing
+static float input_mfcc[MFCC_CHANNELS][MFCC_TIME];
 
-static inline int8_t flash_i8(const int8_t *p, uint32_t i) {
-  return (int8_t)pgm_read_byte(p + i);
-}
-static inline int32_t flash_i32(const int32_t *p, uint32_t i) {
-  return (int32_t)pgm_read_dword(p + i);
-}
-static inline uint8_t clamp_u8(int32_t x) {
-  if (x < 0) return 0;
-  if (x > 255) return 255;
-  return (uint8_t)x;
-}
+// ---------------------------------------------------------------------
+// Generic 1D convolution with on-the-fly int8 dequantization.
+//   x        : input tensor, shape (C_in, L), flattened row-major
+//   x_cin,x_l: dims of x
+//   w_q      : int8 weight tensor, shape (C_out, C_in/groups, K), flattened
+//   w_scale  : single per-tensor scale (zero_point assumed 0)
+//   bias     : float32 bias, shape (C_out)
+//   out      : output buffer, shape (C_out, L_out), flattened row-major
+//   c_out,k,stride,padding,groups : conv hyperparameters
+//   apply_relu : whether to clamp negatives to 0 after adding bias
+// ---------------------------------------------------------------------
+void conv1d_int8(const float *x, int x_cin, int x_l,
+                  const int8_t *w_q, float w_scale,
+                  const float *bias,
+                  float *out, int c_out, int k, int stride, int padding, int groups,
+                  bool apply_relu) {
+  int in_per_group  = x_cin / groups;
+  int out_per_group = c_out / groups;
+  int l_pad = x_l + 2 * padding;
+  int l_out = (l_pad - k) / stride + 1;
 
-// Conv1d operating directly on real-valued (float) input, producing a
-// quantized uint8 output. Used only for the stem layer, since that's the
-// only layer that consumes the raw float MFCC tensor.
-//
-// Math: for a normal quantized conv, acc = sum((x_q - x_zp) * w_q) + bias_q,
-// then out = round(acc * (in_scale*w_scale/out_scale)) + out_zp.
-// Since (x_q - x_zp) * in_scale == x_real, we can substitute the float
-// value directly and only need to scale by w_scale instead of the full
-// in_scale*w_scale product.
-void conv1d_float_in_q_out(const float *in, uint8_t *out,
-                            int in_ch, int out_ch, int in_len,
-                            int kernel, int stride, int pad, int groups,
-                            const int8_t *w, const int32_t *bias,
-                            float in_scale, float w_scale, float out_scale,
-                            int out_zp, bool relu) {
-  int out_len = (in_len + 2 * pad - kernel) / stride + 1;
-  int in_per_group = in_ch / groups;
-  int out_per_group = out_ch / groups;
-
-  for (int oc = 0; oc < out_ch; ++oc) {
-    int g = oc / out_per_group;
-    for (int ox = 0; ox < out_len; ++ox) {
-      // Bias is stored quantized in the int32 bias buffer, at bias_scale
-      // = in_scale * w_scale (standard convention), so convert to a real
-      // accumulator here rather than an integer one.
-      float acc = (float)flash_i32(bias, oc) * in_scale * w_scale;
-      for (int icg = 0; icg < in_per_group; ++icg) {
-        int ic = g * in_per_group + icg;
-        for (int k = 0; k < kernel; ++k) {
-          int ix = ox * stride + k - pad;
-          if (ix >= 0 && ix < in_len) {
-            float xv = in[ic * in_len + ix]; // real float value, no zero-point
-            uint32_t wi = ((uint32_t)oc * in_per_group + icg) * kernel + k;
-            float wv = (float)flash_i8(w, wi) * w_scale;
+  for (int g = 0; g < groups; g++) {
+    for (int oc_local = 0; oc_local < out_per_group; oc_local++) {
+      int oc = g * out_per_group + oc_local;
+      for (int t = 0; t < l_out; t++) {
+        float acc = 0.0f;
+        int start = t * stride - padding;  // position in the (unpadded) input
+        for (int ic_local = 0; ic_local < in_per_group; ic_local++) {
+          int ic = g * in_per_group + ic_local;
+          for (int kk = 0; kk < k; kk++) {
+            int in_pos = start + kk;
+            if (in_pos < 0 || in_pos >= x_l) continue;  // implicit zero padding
+            float xv = x[ic * x_l + in_pos];
+            // --- dequantize weight on the fly: real_w = int8_w * scale ---
+            int8_t wq = w_q[(oc * in_per_group + ic_local) * k + kk];
+            float wv = (float)wq * w_scale;
             acc += xv * wv;
           }
         }
+        acc += bias[oc];
+        if (apply_relu && acc < 0.0f) acc = 0.0f;
+        out[oc * l_out + t] = acc;
       }
-      int32_t qv = (int32_t)lrintf(acc / out_scale) + out_zp;
-      if (relu && qv < out_zp) qv = out_zp;
-      out[oc * out_len + ox] = clamp_u8(qv);
     }
   }
 }
 
-// General Conv1d, weights layout [out_ch][in_ch/groups][kernel].
-// Used for every layer after the stem, which all consume quantized uint8
-// activations.
-void conv1d_q(const uint8_t *in, uint8_t *out,
-              int in_ch, int out_ch, int in_len,
-              int kernel, int stride, int pad, int groups,
-              const int8_t *w, const int32_t *bias,
-              int in_zp, float multiplier, int out_zp,
-              bool relu) {
-  int out_len = (in_len + 2 * pad - kernel) / stride + 1;
-  int in_per_group = in_ch / groups;
-  int out_per_group = out_ch / groups;
+void global_avg_pool(const float *x, int c, int l, float *out) {
+  for (int ch = 0; ch < c; ch++) {
+    float sum = 0.0f;
+    for (int t = 0; t < l; t++) sum += x[ch * l + t];
+    out[ch] = sum / (float)l;
+  }
+}
 
-  for (int oc = 0; oc < out_ch; ++oc) {
-    int g = oc / out_per_group;
-    for (int ox = 0; ox < out_len; ++ox) {
-      int32_t acc = flash_i32(bias, oc);
-      for (int icg = 0; icg < in_per_group; ++icg) {
-        int ic = g * in_per_group + icg;
-        for (int k = 0; k < kernel; ++k) {
-          int ix = ox * stride + k - pad;
-          if (ix >= 0 && ix < in_len) {
-            int32_t xv = (int32_t)in[ic * in_len + ix] - in_zp;
-            uint32_t wi = ((uint32_t)oc * in_per_group + icg) * kernel + k;
-            int32_t wv = (int32_t)flash_i8(w, wi);
-            acc += xv * wv;
-          }
-        }
-      }
-      int32_t qv = (int32_t)lrintf((float)acc * multiplier) + out_zp;
-      if (relu && qv < out_zp) qv = out_zp;
-      out[oc * out_len + ox] = clamp_u8(qv);
+void linear_int8(const float *x, int c_in,
+                  const int8_t *w_q, float w_scale,
+                  const float *bias,
+                  float *out, int c_out) {
+  for (int oc = 0; oc < c_out; oc++) {
+    float acc = 0.0f;
+    for (int ic = 0; ic < c_in; ic++) {
+      int8_t wq = w_q[oc * c_in + ic];
+      float wv = (float)wq * w_scale;
+      acc += x[ic] * wv;
     }
+    out[oc] = acc + bias[oc];
   }
 }
 
-void avgpool_q(const uint8_t *in, uint8_t *out, int channels, int len) {
-  for (int c = 0; c < channels; ++c) {
-    int32_t sum = 0;
-    for (int t = 0; t < len; ++t) sum += in[c * len + t];
-    out[c] = (uint8_t)((sum + len / 2) / len);
-  }
-}
+void run_inference() {
+  unsigned long t0 = micros();
 
-void linear_q(const uint8_t *in, uint8_t *out) {
-  const float mult = (FC_IN_SCALE * FC_W_SCALE) / FC_OUT_SCALE;
-  for (int oc = 0; oc < NUM_CLASSES; ++oc) {
-    int32_t acc = flash_i32(FC_B, oc);
-    for (int ic = 0; ic < OUT_CH; ++ic) {
-      int32_t xv = (int32_t)in[ic] - FC_IN_ZP;
-      int32_t wv = (int32_t)flash_i8(FC_W, oc * OUT_CH + ic);
-      acc += xv * wv;
-    }
-    out[oc] = clamp_u8((int32_t)lrintf((float)acc * mult) + FC_OUT_ZP);
-  }
-}
+  // --- stem: Conv1d(13->22, k=5, s=2, p=2) + ReLU ---
+  conv1d_int8(&input_mfcc[0][0], STEM_CIN, MFCC_TIME,
+              stem_w_q, stem_w_scale, stem_bias,
+              &stem_out[0][0], STEM_COUT, STEM_K, /*stride*/2, /*pad*/2, /*groups*/1,
+              /*relu*/true);
 
-int predict(const float *mfcc) {
-  // Stem conv now reads the raw float MFCC tensor directly -- no
-  // quantize_input() step and no input_q buffer.
-  conv1d_float_in_q_out(mfcc, stem_out, MFCC_CH, WIDTH, INPUT_LEN,
-                         5, 2, 2, 1, STEM_W, STEM_B,
-                         STEM_IN_SCALE, STEM_W_SCALE, STEM_OUT_SCALE,
-                         STEM_OUT_ZP, true);
+  // --- block1.depthwise: Conv1d(22->22, k=3, s=1, p=1, groups=22) + ReLU ---
+  conv1d_int8(&stem_out[0][0], STEM_COUT, 51,
+              b1dw_w_q, b1dw_w_scale, b1dw_bias,
+              &b1dw_out[0][0], B1DW_C, B1DW_K, /*stride*/1, /*pad*/1, /*groups*/22,
+              /*relu*/true);
 
-  conv1d_q(stem_out, b1_dw, WIDTH, WIDTH, STEM_LEN,
-           3, 1, 1, WIDTH, B1_DW_W, B1_DW_B, B1_DW_IN_ZP,
-           (B1_DW_IN_SCALE * B1_DW_W_SCALE) / B1_DW_OUT_SCALE, B1_DW_OUT_ZP, true);
+  // --- block1.pointwise: Conv1d(22->22, k=1) + ReLU ---
+  conv1d_int8(&b1dw_out[0][0], B1DW_C, 51,
+              b1pw_w_q, b1pw_w_scale, b1pw_bias,
+              &b1pw_out[0][0], B1PW_COUT, /*k*/1, /*stride*/1, /*pad*/0, /*groups*/1,
+              /*relu*/true);
 
-  conv1d_q(b1_dw, b1_out, WIDTH, WIDTH, B1_LEN,
-           1, 1, 0, 1, B1_PW_W, B1_PW_B, B1_PW_IN_ZP,
-           (B1_PW_IN_SCALE * B1_PW_W_SCALE) / B1_PW_OUT_SCALE, B1_PW_OUT_ZP, true);
+  // --- block2.depthwise: Conv1d(22->22, k=3, s=2, p=1, groups=22) + ReLU ---
+  conv1d_int8(&b1pw_out[0][0], B1PW_COUT, 51,
+              b2dw_w_q, b2dw_w_scale, b2dw_bias,
+              &b2dw_out[0][0], B2DW_C, B2DW_K, /*stride*/2, /*pad*/1, /*groups*/22,
+              /*relu*/true);
 
-  conv1d_q(b1_out, b2_dw, WIDTH, WIDTH, B1_LEN,
-           3, 2, 1, WIDTH, B2_DW_W, B2_DW_B, B2_DW_IN_ZP,
-           (B2_DW_IN_SCALE * B2_DW_W_SCALE) / B2_DW_OUT_SCALE, B2_DW_OUT_ZP, true);
+  // --- block2.pointwise: Conv1d(22->44, k=1) + ReLU ---
+  conv1d_int8(&b2dw_out[0][0], B2DW_C, 26,
+              b2pw_w_q, b2pw_w_scale, b2pw_bias,
+              &b2pw_out[0][0], B2PW_COUT, /*k*/1, /*stride*/1, /*pad*/0, /*groups*/1,
+              /*relu*/true);
 
-  conv1d_q(b2_dw, b2_out, WIDTH, OUT_CH, B2_LEN,
-           1, 1, 0, 1, B2_PW_W, B2_PW_B, B2_PW_IN_ZP,
-           (B2_PW_IN_SCALE * B2_PW_W_SCALE) / B2_PW_OUT_SCALE, B2_PW_OUT_ZP, true);
+  // --- global average pool: (44 x 26) -> (44) ---
+  global_avg_pool(&b2pw_out[0][0], B2PW_COUT, 26, pooled);
 
-  avgpool_q(b2_out, pooled, OUT_CH, B2_LEN);
-  linear_q(pooled, logits_q);
+  // --- fc: Linear(44->12) ---
+  linear_int8(pooled, FC_CIN, fc_w_q, fc_w_scale, fc_bias, logits, FC_COUT);
 
+  unsigned long dt = micros() - t0;
+
+  // --- find argmax ---
   int best = 0;
-  for (int i = 1; i < NUM_CLASSES; ++i)
-    if (logits_q[i] > logits_q[best]) best = i;
-  return best;
+  for (int i = 1; i < FC_COUT; i++) if (logits[i] > logits[best]) best = i;
+
+  Serial.println();
+  Serial.println(F("===== ESP8266 DS-CNN Inference ====="));
+  Serial.print(F("Inference time (us): "));
+  Serial.println(dt);
+  Serial.println(F("Logits:"));
+  for (int i = 0; i < FC_COUT; i++) {
+    Serial.print(F("  logit["));
+    Serial.print(i);
+    Serial.print(F("] = "));
+    Serial.println(logits[i], 6);
+  }
+  Serial.print(F("Predicted class index: "));
+  Serial.println(best);
+  Serial.print(F("Predicted class name : "));
+  Serial.println(CLASS_NAMES[best]);
+  Serial.println(F("====================================="));
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\nESP8266 TinyStudentDSCNN");
+  delay(2000);
+   Serial.println("\n[1] DEVICE INFORMATION");
 
-  // DEMO ONLY: replace this with your real MFCC tensor, shape [13][INPUT_LEN].
-  static float mfcc[MFCC_CH * INPUT_LEN] =  {
-  -352.731232f, -352.780518f, -350.108826f, -352.227051f, -352.687622f, -356.334595f, -356.950592f, -359.056244f,
-  -357.143463f, -356.075470f, -353.857635f, -356.585144f, -357.267853f, -351.819153f, -345.962067f, -344.746277f,
-  -341.617859f, -341.944427f, -347.388000f, -348.969513f, -343.681549f, -334.606140f, -115.126518f, -5.135695f,
-  -27.256916f, 4.723876f, 9.285079f, 2.435237f, 2.514969f, 4.336694f, -2.172909f, -2.036929f,
-  -4.543397f, -6.701606f, -7.669481f, -21.789999f, -22.967035f, -25.766722f, -26.291306f, -34.923164f,
-  -39.688145f, -37.502670f, -42.276985f, -54.093384f, -57.927204f, -61.673996f, -63.936691f, -68.463501f,
-  -78.486549f, -90.624352f, -95.251831f, -97.399551f, -98.410828f, -97.623894f, -92.125435f, -104.872269f,
-  -107.204010f, -117.141922f, -130.289169f, -136.954376f, -136.688034f, -137.395187f, -137.977005f, -148.825150f,
-  -154.856506f, -160.194031f, -161.859909f, -163.499680f, -171.905197f, -184.182587f, -185.209305f, -187.201065f,
-  -128.093811f, -140.420761f, -151.583191f, -164.430420f, -177.188187f, -188.105408f, -211.672485f, -234.667343f,
-  -245.550171f, -256.399658f, -254.441940f, -261.160950f, -267.430634f, -265.009521f, -276.364502f, -277.269989f,
-  -277.733826f, -283.576172f, -292.079254f, -298.314606f, -282.829742f, -283.471100f, -282.886658f, -287.062469f,
-  -282.642944f, -284.525726f, -286.045776f, -295.671814f, -301.226685f, 7.621198f, 8.269523f, 11.427706f,
-  8.850394f, 7.483930f, 5.389190f, 3.996558f, 0.648172f, 3.900214f, 3.596911f, 6.688621f,
-  1.826645f, -1.018456f, 0.515952f, 3.362719f, 9.564306f, 14.246977f, 10.964424f, 9.361700f,
-  10.564240f, 14.628102f, 20.716263f, 40.976871f, 58.238598f, 53.170868f, 58.282890f, 51.289711f,
-  49.570492f, 54.488605f, 52.746292f, 49.887245f, 51.599541f, 52.960442f, 55.613560f, 58.289558f,
-  58.214272f, 55.992970f, 60.328655f, 58.875900f, 69.150490f, 65.188179f, 65.151672f, 70.281250f,
-  83.234322f, 83.381996f, 89.557297f, 88.560471f, 95.526024f, 99.273148f, 105.238335f, 104.508339f,
-  111.616364f, 112.293800f, 108.949036f, 113.275581f, 109.531219f, 112.287071f, 112.800514f, 102.197655f,
-  102.102257f, 102.915962f, 98.923637f, 98.675629f, 94.732101f, 87.244476f, 73.251717f, 67.820023f,
-  58.415947f, 49.072243f, 37.380306f, 45.761261f, 34.044945f, 68.053246f, 58.974701f, 48.282383f,
-  58.730984f, 48.420460f, 47.623753f, 41.166817f, 27.393578f, 25.585316f, 23.072758f, 23.758383f,
-  24.356312f, 23.370428f, 27.763353f, 19.490665f, 18.944529f, 21.177923f, 12.391367f, 7.274575f,
-  0.708073f, 14.397237f, 12.288413f, 11.177995f, 11.853371f, 17.878061f, 20.813759f, 24.584185f,
-  26.460072f, 22.487341f, 4.734566f, 6.605061f, 6.392353f, 3.154820f, 1.339539f, 4.189857f,
-  1.737209f, -0.706449f, 1.817890f, 0.884033f, 3.129154f, -0.265833f, 2.768448f, 8.606443f,
-  16.132183f, 14.086122f, 14.133676f, 13.030938f, 6.755130f, 4.094749f, 4.501709f, 7.132565f,
-  -34.299248f, -36.672955f, -14.308894f, -18.302063f, -8.838093f, -9.940249f, -14.880322f, -18.333725f,
-  -17.624466f, -20.192999f, -23.244444f, -24.811087f, -24.787766f, -22.792582f, -23.584227f, -15.877691f,
-  -14.259807f, -8.085315f, -9.883754f, -2.563720f, -0.532073f, 3.663105f, 9.767875f, 5.790619f,
-  11.110473f, 10.613018f, 11.413370f, 18.157234f, 20.584259f, 12.721272f, 11.515872f, 14.486627f,
-  2.328677f, 8.728011f, 8.307013f, 10.998635f, 19.570684f, 25.652025f, 26.094410f, 30.301950f,
-  29.410070f, 30.665932f, 33.283298f, 28.619576f, 29.985071f, 25.017925f, 23.696405f, 7.657548f,
-  4.248428f, -2.938347f, -37.864708f, -35.169540f, -27.981714f, -16.574856f, -12.872586f, -4.639351f,
-  -2.837634f, 5.802892f, 14.710495f, 11.726838f, 15.254658f, 8.529405f, 10.432371f, 12.575489f,
-  8.051060f, 12.738622f, 15.828809f, 10.087675f, 6.947003f, 6.690949f, 9.646458f, 4.781392f,
-  2.754681f, 1.771342f, -1.694789f, -0.558925f, 2.723821f, 11.664624f, 10.530167f, 1.343664f,
-  2.596521f, 2.206221f, -0.535677f, -2.224638f, 2.766874f, -0.113707f, -1.751366f, -0.492254f,
-  -1.166159f, 1.565531f, 0.277825f, -2.766404f, -4.298506f, -2.393825f, 1.189737f, 1.906084f,
-  0.191791f, 1.035583f, 2.260861f, 3.622319f, 0.624782f, 1.174322f, 9.403305f, 9.845587f,
-  5.951144f, -4.410666f, -3.743049f, -10.811580f, -3.184436f, -12.195141f, -12.795143f, -11.536503f,
-  -12.531049f, -13.023419f, -13.506090f, 4.882189f, -2.530754f, -8.510705f, -9.472109f, -2.625388f,
-  -10.486749f, -11.853865f, -11.677267f, -14.498513f, -5.329288f, -8.202610f, -13.070469f, -8.679921f,
-  -11.792799f, -9.356733f, -12.860893f, -12.808301f, -11.056557f, -10.923265f, -8.967764f, -13.669851f,
-  -14.210053f, -9.610145f, -9.593768f, -7.161252f, -2.640390f, -3.356126f, -1.506314f, 6.508603f,
-  13.765052f, 14.086048f, 13.022979f, 12.647956f, 15.449588f, 10.154835f, -1.261211f, -17.984070f,
-  -5.725612f, -3.499291f, -3.025848f, -2.161007f, -1.409804f, -8.600264f, 1.315893f, 3.471642f,
-  3.681227f, 7.034991f, -3.539968f, -2.741951f, -3.585477f, -3.940818f, -5.017335f, -5.980499f,
-  -6.686321f, -1.630776f, -8.548699f, 4.160470f, 5.420474f, 3.036056f, -2.135316f, -9.601316f,
-  -12.196123f, -13.601905f, -1.257872f, -2.096511f, 0.749509f, 1.335901f, -0.569323f, -1.090502f,
-  -3.143071f, 1.615896f, -0.431334f, -0.523051f, -2.020446f, 0.105119f, 1.047426f, 2.794444f,
-  0.969296f, 4.200891f, 9.921938f, 5.578366f, 4.555936f, 8.244216f, 2.612657f, 3.275034f,
-  5.860648f, 2.595177f, -13.246080f, -23.475838f, -19.984238f, -24.840496f, -24.387478f, -24.712799f,
-  -17.425209f, -27.651918f, -24.685589f, -19.413000f, -20.052889f, -21.561644f, -19.030737f, -21.633793f,
-  -24.503483f, -21.337980f, -26.127367f, -25.630169f, -19.318792f, -28.938889f, -30.916897f, -34.477341f,
-  -32.542412f, -38.768253f, -39.123253f, -38.834648f, -41.384487f, -41.133587f, -42.993816f, -36.150661f,
-  -36.324722f, -33.555107f, -26.030214f, -26.478483f, -15.228837f, -9.708061f, -6.524507f, -6.162083f,
-  -9.047663f, -7.400760f, -7.405879f, -2.264534f, -0.000468f, 9.158107f, 16.630110f, 12.808824f,
-  15.195246f, 13.693529f, 11.310206f, 1.316346f, -12.216207f, -4.778206f, -8.942417f, -5.783501f,
-  3.469206f, 4.344753f, 1.002166f, 3.260738f, 6.458115f, 3.297693f, 2.233325f, -4.876352f,
-  -0.773245f, 0.450629f, -4.444649f, -6.714840f, -8.194695f, -6.090681f, 0.482432f, -3.433029f,
-  -1.119642f, -0.781562f, -1.619166f, -9.737293f, -5.120473f, -5.746345f, -8.128142f, -6.491219f,
-  -6.697493f, 0.388339f, -0.120430f, 0.072245f, -1.354307f, -4.741782f, 0.871539f, 0.511034f,
-  0.705431f, -2.325881f, 1.303444f, 0.301432f, -0.493598f, -2.367436f, -5.834640f, -5.409863f,
-  -5.392113f, -5.923619f, -6.156957f, -4.801137f, -2.936070f, -2.977942f, -7.162580f, -25.193146f,
-  -24.474108f, -22.520998f, -5.217456f, -5.513221f, -3.954185f, -3.193187f, 2.051834f, 2.057923f,
-  2.057168f, 2.029807f, 0.958776f, 1.083645f, -2.374671f, 4.472213f, 0.151935f, 6.260251f,
-  1.951776f, 3.483852f, -3.722427f, -4.597886f, -5.148091f, -8.960485f, -7.355696f, -7.581409f,
-  -3.978097f, -7.916160f, -9.304794f, -13.241624f, -12.335923f, -15.665611f, -19.655821f, -15.016300f,
-  -14.083814f, -5.387988f, -5.454410f, -4.111288f, 0.976022f, -0.464048f, -0.870399f, -3.478596f,
-  -2.024893f, 4.864239f, 4.203131f, 5.032083f, 3.929259f, 12.492378f, 19.476765f, 18.881603f,
-  3.649526f, -16.233707f, -11.496506f, -8.888306f, -11.409743f, -9.746969f, -6.765700f, -1.258473f,
-  -0.689987f, 0.343115f, 0.426656f, 1.959727f, 1.045927f, -2.905014f, -6.044976f, -13.266326f,
-  -8.340826f, -8.941803f, -4.478354f, 1.816895f, -5.100279f, -0.859590f, 2.677136f, -3.088892f,
-  1.434519f, -5.584224f, -9.526677f, -9.063127f, -3.814330f, -1.641490f, -1.399269f, -1.328410f,
-  -1.014582f, -3.378945f, -5.792681f, 0.299104f, 1.441833f, 1.062338f, -1.708245f, 0.619831f,
-  -0.423077f, -1.477385f, 1.683343f, 4.124466f, 6.520369f, -2.460677f, -2.932738f, -5.080410f,
-  -8.627110f, -9.256984f, -13.085170f, -13.617479f, 12.155849f, 1.306098f, -6.132444f, -7.271144f,
-  -10.898759f, -8.003236f, -0.757084f, 1.858993f, 2.612554f, -2.087547f, 2.006096f, 3.151649f,
-  3.583298f, 5.601727f, 6.336844f, 6.301165f, 8.156131f, 14.622331f, 9.049070f, 12.548741f,
-  13.936062f, 20.342165f, 19.765533f, 21.053656f, 21.653120f, 17.021835f, 18.420668f, 15.363808f,
-  16.407217f, 15.968080f, 12.705117f, 12.166929f, 9.246027f, 4.988882f, -7.128881f, -1.030507f,
-  -5.647855f, -9.214230f, -11.896896f, -18.749836f, -17.482174f, -12.208321f, -12.431983f, -17.394472f,
-  -16.484898f, -12.994593f, -11.656390f, -5.982625f, -11.487230f, -15.743302f, -27.425816f, -22.794727f,
-  -10.691192f, -16.427130f, -15.383386f, -14.944201f, -11.103216f, -5.507154f, -12.122487f, -10.642890f,
-  -4.601278f, 3.563536f, 6.948622f, -5.753171f, -15.172385f, -7.351580f, -8.472763f, -2.698394f,
-  -3.687216f, -12.774661f, -5.632311f, -2.770938f, -8.266619f, 4.630626f, 4.152900f, 0.958950f,
-  -11.178802f, -2.923309f, -1.078231f, -4.953581f, -2.163253f, -4.112570f, -5.757145f, -3.221099f,
-  -0.389008f, 1.300767f, 0.290723f, -0.909989f, -0.038712f, 0.914495f, 0.042504f, -1.229446f,
-  -3.101465f, -6.170287f, -10.475810f, -8.874766f, -12.531268f, -8.905528f, -9.285681f, -11.534609f,
-  -13.823800f, -29.307241f, -32.366234f, -23.370049f, -10.890553f, -3.023400f, -1.733591f, 1.437907f,
-  0.186226f, -1.384867f, 2.515715f, -1.451961f, -0.470128f, -3.800002f, -5.504675f, -11.589104f,
-  -12.658896f, -13.869732f, -18.946690f, -20.603184f, -10.377971f, -13.340892f, -15.185032f, -14.530796f,
-  -9.961143f, -12.999674f, -20.437876f, -18.585342f, -18.792244f, -12.509394f, -13.466908f, -12.042715f,
-  -7.046517f, -5.812664f, -6.381666f, -11.782508f, -13.141518f, -16.193100f, -21.829268f, -19.679489f,
-  -20.842447f, -14.754876f, -18.310650f, -15.403035f, -13.251204f, -16.624163f, -15.385697f, -11.227255f,
-  -8.074238f, -7.778545f, -12.668900f, -27.277287f, -24.960838f, -21.462898f, -19.776184f, -15.485700f,
-  -13.841470f, -7.399231f, 2.357028f, -6.783674f, -12.461038f, -2.386829f, 10.883638f, 17.626974f,
-  8.920543f, 2.951037f, 6.015132f, 3.833222f, 8.737614f, 7.858156f, -2.184033f, 2.483777f,
-  3.517127f, 3.995374f, 7.111137f, 1.368669f, -0.284780f, -3.496187f, -3.457141f, -11.489378f,
-  -7.769360f, -3.959203f, -5.457282f, -6.081225f, 0.557112f, -1.352727f, 0.109568f, -0.634078f,
-  -0.580507f, -1.326839f, 1.014796f, 2.161799f, 1.917543f, 5.933486f, 4.127616f, -3.402646f,
-  -1.895132f, -1.439464f, -0.347518f, -4.946859f, -4.609135f, -4.375204f, 18.939798f, 19.159872f,
-  17.656416f, 15.129388f, 8.664070f, 9.314375f, 2.948605f, 2.039043f, 3.843793f, 3.434849f,
-  3.354945f, -0.579675f, 1.880916f, -3.710377f, -8.840952f, -11.789557f, -11.170122f, -12.510380f,
-  -11.847982f, -18.355919f, -19.255117f, -16.180372f, -16.914566f, -17.673096f, -13.948729f, -8.474121f,
-  -7.876437f, -12.091575f, -21.422972f, -21.763638f, -20.747734f, -25.373131f, -23.798557f, -25.842644f,
-  -19.968580f, -21.026386f, -17.658834f, -15.066533f, -11.838467f, -7.716546f, -2.920496f, -7.708652f,
-  -6.523556f, -11.072492f, -8.931931f, -8.005083f, -5.076041f, -5.445263f, -5.305481f, -8.252532f,
-  -6.107575f, -12.183450f, -15.394274f, -12.570551f, -13.909299f, -6.341656f, 0.068978f, 5.642931f,
-  -3.905224f, -8.748657f, -0.581804f, 0.850041f, 3.637960f, 2.136173f, -3.673858f, -5.455351f,
-  -4.720997f, 5.683990f, 1.800759f, 3.766467f, -5.007964f, 1.976579f, -1.045235f, -2.135771f,
-  -3.135579f, -7.703163f, -10.351671f, -7.391926f, -9.024316f, -5.941214f, -2.739767f, -5.811984f,
-  -4.102120f, 1.144166f, -2.318853f, -1.218059f, -0.309350f, -0.869552f, -0.255109f, -0.785678f,
-  -0.814140f, -1.494992f, -1.505248f, -5.312488f, -8.101964f, -8.300243f, -5.320551f, -1.274599f,
-  -5.721175f, -4.071852f, -3.613752f, -14.157424f, -13.009801f, 4.489370f, 9.796679f, 6.698552f,
-  4.403385f, 8.175850f, 4.739033f, 6.609882f, 9.516229f, 7.949190f, 8.841308f, 8.641554f,
-  2.437500f, -1.949145f, -3.666219f, -3.132707f, -5.075574f, -4.390843f, -2.743728f, 0.938605f,
-  0.524474f, 3.767753f, 2.836527f, 1.409777f, -0.912364f, 0.998957f, 10.604561f, 8.180042f,
-  12.407755f, 6.878331f, 2.367517f, 1.311970f, -0.606242f, 1.265960f, -1.077132f, 2.791596f,
-  2.831736f, 1.333613f, 5.062836f, -1.678674f, 3.513049f, 5.366485f, 0.979410f, 3.383170f,
-  5.721573f, 2.480769f, 2.136658f, 2.952146f, -2.367559f, 13.736690f, 8.382447f, 11.683979f,
-  9.784102f, 9.574135f, 6.795446f, 6.704847f, 6.944209f, 6.024711f, 2.744789f, 6.633301f,
-  9.296186f, 10.199278f, 3.141259f, 0.442285f, -0.883030f, 0.129865f, 2.060291f, 5.562513f,
-  4.811419f, -2.329782f, -3.089082f, -3.296747f, -0.398932f, -2.507262f, 0.899186f, -2.505867f,
-  -3.730790f, 0.384311f, -4.129365f, -2.875467f, -2.566824f, -1.379003f, -1.499180f, -2.919325f,
-  -1.805061f, 0.056273f, -1.402782f, -0.886471f, -2.642745f, -2.346246f, 1.520687f, 3.726137f,
-  3.316729f, -3.291456f, -5.585054f, -0.861925f, -0.038652f, -7.550926f, -6.296441f, -5.103812f,
-  3.051517f, 3.851946f, 9.527675f, 7.942199f, 4.800903f, 6.436821f, 3.972124f, -3.970210f,
-  2.828099f, 8.373686f, 15.578111f, 14.921638f, 14.149567f, 13.338504f, 11.140651f, 13.667317f,
-  12.447122f, 17.415213f, 17.828335f, 14.967599f, 14.563844f, 13.440293f, 6.204124f, 5.829648f,
-  4.862893f, 10.712437f, 5.047748f, 2.779425f, 2.314167f, -3.427943f, -0.885986f, 6.055175f,
-  9.508805f, 7.035320f, 4.630131f, 5.290802f, 0.677650f, 2.850440f, -0.534557f, -3.620027f,
-  -1.306775f, 0.030082f, -2.403493f, -0.697448f, -0.638838f, 4.631321f, 5.464832f, 0.616044f,
-  -3.090767f, 4.390383f, -6.546479f, -5.775549f, -1.645220f, -7.979021f, -8.537187f, -6.480879f,
-  -5.348611f, -5.914609f, -2.818322f, -2.309698f, -2.719374f, 1.064194f, 0.752751f, 0.234158f,
-  -2.700425f, -8.662294f, -6.885237f, -8.156824f, -8.551768f, -6.145576f, -0.720964f, -3.490119f,
-  -9.402488f, -1.870840f, -9.828922f, -7.123874f, -8.091646f, -5.940370f, -8.434754f, -0.083707f,
-  -0.223913f, 1.915995f, 0.881521f, -1.644854f, -2.853997f, -1.531046f, 0.531484f, -1.615366f,
-  -0.652571f, -3.592127f, -1.500061f, -0.816856f, -3.330034f, -3.768455f, -5.061772f, -5.343207f,
-  -2.269684f, -0.744544f, -4.404867f, -3.866072f, -2.391707f, -8.815941f, -11.835726f, -15.091222f,
-  -10.795467f, -11.138660f, -11.840621f, -15.408048f, -13.080503f, -15.335886f, -13.854456f, -13.681585f,
-  -12.889104f, -12.682403f, -13.020127f, -11.188240f, -13.746909f, -15.850560f, -11.466874f, -16.003508f,
-  -17.377834f, -17.064928f, -16.374903f, -17.975206f, -16.832724f, -16.990801f, -21.089493f, -15.766124f,
-  -18.914680f, -12.480696f, -7.647789f, -11.287214f, -13.685007f, -10.860254f, -1.156669f, -3.317996f,
-  -5.601097f, -7.016237f, -3.352508f, -4.198926f, -8.373326f, -5.069274f, -7.469663f, -7.136827f,
-  -9.531989f, -7.733085f, -13.031436f, -8.543870f, -12.670998f, -14.293031f, -13.224685f, -15.664884f,
-  -11.244102f, -12.543266f, -16.339027f, -20.663879f, -9.034184f, -9.810143f, -6.708963f, -3.949424f,
-  -2.138098f, -4.461594f, -1.332357f, -0.295716f, 0.676347f, -2.992036f, -2.016619f, 5.383067f,
-  3.801647f, 5.509173f, 3.352817f, -2.626284f, -4.425166f, -5.333797f, -1.210298f, -2.191205f,
-  2.739310f, 8.016813f, -1.455446f, -1.665081f, -0.210152f, -0.684252f, 2.625654f, 2.312927f,
-  1.478925f, -2.230257f, -0.935056f, -0.189827f, -1.176411f, -2.110759f, -2.132258f, -0.497709f,
-  1.875912f, 0.885837f, 1.813456f, 1.419124f, 2.678530f, 6.212118f, 5.117908f, 2.289205f,
-  2.713590f, 7.605949f, 5.020373f, 11.039781f, 3.689611f, 3.806700f, 3.432420f, -2.030044f,
-  -3.679040f, -0.249909f, -4.942540f, -4.620405f, -4.713931f, -3.913107f, -2.846492f, 0.506767f,
-  4.728951f, 7.790737f, 10.182302f, 11.843698f, 16.436344f, 16.692884f, 13.998610f, 14.599401f,
-  18.228540f, 20.848570f, 17.676090f, 12.386391f, 13.477563f, 12.183509f, 10.295382f, 11.240125f,
-  10.236859f, 5.615221f, -0.398052f, 1.809452f, -0.857676f, 2.234059f, 3.160773f, -1.281838f,
-  -3.441954f, -4.649839f, -5.718103f, -3.084466f, -1.932017f, -1.064636f, -1.734511f, -0.847719f,
-  -2.349949f, -7.751131f, -5.952084f, -2.910858f, 5.773657f, 7.546019f, 6.178712f, -0.673016f,
-  -3.953019f, -2.533312f, -7.342276f, -1.082474f, -0.811112f, -6.178205f, -10.955112f, -8.834232f,
-  -9.175788f, 0.027814f, 0.456618f, 5.450584f, 10.994052f, 1.382416f, -1.034402f, -2.459379f,
-  -5.530565f, -9.878134f, -10.350435f, -5.534873f, -7.975909f, -1.467038f, 6.735884f, 4.148775f,
-  0.285943f
-};
+    Serial.printf("CPU Frequency     : %u MHz\n",
+                  ESP.getCpuFreqMHz());
 
-  int cls = predict(mfcc);
-  Serial.print("Predicted class index: ");
-  Serial.println(cls);
+    Serial.printf("Chip ID           : %08X\n",
+                  ESP.getChipId());
 
-  Serial.println("Quantized logits:");
-  for (int i = 0; i < NUM_CLASSES; ++i) {
-    float real_logit = ((int32_t)logits_q[i] - FC_OUT_ZP) * FC_OUT_SCALE;
-    Serial.print(i); Serial.print(": "); Serial.println(real_logit, 6);
+    Serial.printf("Flash Size        : %u bytes\n",
+                  ESP.getFlashChipSize());
+
+    Serial.printf("Flash Speed       : %u Hz\n",
+                  ESP.getFlashChipSpeed());
+  Serial.println(F("Loading sample MFCC input from PROGMEM..."));
+
+  // Copy the PROGMEM sample MFCC into RAM
+  for (int c = 0; c < MFCC_CHANNELS; c++) {
+    for (int t = 0; t < MFCC_TIME; t++) {
+      input_mfcc[c][t] = pgm_read_float(&sample_mfcc[c * MFCC_TIME + t]);
+    }
   }
+
+  Serial.println(F("Running inference..."));
+  run_inference();
 }
 
 void loop() {
-  delay(1000);
+  // Nothing to do; inference runs once in setup().
+  // To run continuously (e.g. with live MFCC features from a microphone),
+  // move the body of setup()'s "load input + run_inference()" logic here
+  // and replace input_mfcc[][] with freshly computed MFCC frames.
+  delay(5000);
 }
